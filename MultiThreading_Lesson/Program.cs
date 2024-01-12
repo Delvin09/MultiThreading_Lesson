@@ -42,7 +42,7 @@ namespace MultiThreading_Lesson
             for (int i = 0; i < threads.Length; i++)
             {
                 randoms[i] = new Random();
-                threads[i] = new Thread(ThreadProc);
+                threads[i] = new Thread(ThreadProc) { IsBackground = true };
                 threads[i].Start(i);
             }
 
