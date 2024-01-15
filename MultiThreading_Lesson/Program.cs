@@ -1,67 +1,273 @@
 ﻿using System.Diagnostics;
 using System.Drawing;
+using System.Threading;
 using System.Threading.Channels;
 
 namespace MultiThreading_Lesson
 {
-    class SomeClasse
+    class SingleTaskScheduler : TaskScheduler
     {
         private readonly object sync = new object();
 
-        private int sum = 0;
+        private readonly Queue<Task> tasks = new Queue<Task>();
 
-        public int Sum => sum;
+        private Thread thread;
 
-        public bool IsCanceled { get; set; }
-
-        public void ProcThread()
+        public SingleTaskScheduler()
         {
-            for (int i = 0; i < 100_000_000; i++)
-                if (IsCanceled)
-                    break;
-                else
-                    sum++;
+            thread = new Thread(ExcecuteTask) { Name = "OneForAll", IsBackground = true };
+            thread.Start();
+        }
+
+        protected override IEnumerable<Task>? GetScheduledTasks()
+        {
+            return tasks;
+        }
+
+        protected override void QueueTask(Task task)
+        {
+            lock (sync)
+            {
+                tasks.Enqueue(task);
+            }
+        }
+
+        private void ExcecuteTask(object? obj)
+        {
+            while (true)
+            {
+                lock (sync)
+                {
+                    if (tasks.Count > 0)
+                    {
+                        var task = tasks.Peek();
+                        if (TryDequeue(task))
+                            TryExecuteTask(task);
+                    }
+                }
+            }
+        }
+
+        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
+        {
+            return false;
+        }
+
+        protected override bool TryDequeue(Task task)
+        {
+            Task currentTask;
+            lock (sync)
+            {
+                currentTask = tasks.Dequeue();
+            }
+
+            return currentTask == task;
         }
     }
 
-    class GenRandomArray
+    class MultiTaskRandomProcessor<T>
     {
-        private Thread[] threads;
-        private int[] result;
-        private Random[] randoms;
+        private readonly Task[] _tasks;
+        private readonly T[] _array;
+        private readonly Func<Random, T> _randomize;
+        protected readonly Random[] _randoms;
 
-        public GenRandomArray(int threadCount, int[] resultArray)
+        public MultiTaskRandomProcessor(int threadCount, T[] array, Func<Random, T> randomize)
         {
-            threads = new Thread[threadCount];
-            result = resultArray;
-            randoms = new Random[threadCount];
+            _tasks = new Task[threadCount];
+            _array = array;
+            _randomize = randomize;
+            _randoms = new Random[threadCount];
         }
 
-        public void Process()
+        public virtual Task Process(CancellationToken cancellationToken = default)
         {
-            for (int i = 0; i < threads.Length; i++)
+            for (var i = 0; i < _randoms.Length; i++)
             {
-                randoms[i] = new Random();
-                threads[i] = new Thread(ThreadProc) { IsBackground = true };
-                threads[i].Start(i);
+                _randoms[i] = new Random();
+            }
+            for (int i = 0; i < _tasks.Length; i++)
+            {
+                var index = i;
+                _tasks[i] = Task.Run(() => ThreadProc(index, cancellationToken), cancellationToken);
             }
 
-            foreach (var thread in threads) thread.Join();
+            return Task.WhenAll(_tasks);
+        }
+
+        private void ThreadProc(int threadIndex, CancellationToken cancellationToken = default)
+        {
+            var length = _tasks.Length;
+            var index = threadIndex;
+            var count = _array.Length / length;
+
+            var span = index == length - 1
+                ? _array.AsSpan((index * count)..)
+                : _array.AsSpan((index * count)..((index * count) + count));
+
+            for (var i = 0; !cancellationToken.IsCancellationRequested && i < span.Length; i++)
+            {
+                ProcessValue(index, i, span);
+            }
+        }
+
+        protected void ProcessValue(int threadIndex, int itemIndex, Span<T> span)
+        {
+            span[itemIndex] = _randomize(_randoms[threadIndex]);
+        }
+    }
+
+    abstract class MultiThreadingProcessor<T>
+    {
+        private readonly Thread[] _threads;
+        private readonly T[] _array;
+
+        public MultiThreadingProcessor(int threadCount, T[] array)
+        {
+            _threads = new Thread[threadCount];
+            _array = array;
+        }
+
+        public virtual void Process()
+        {
+            for (int i = 0; i < _threads.Length; i++)
+            {
+                _threads[i] = new Thread(ThreadProc) { IsBackground = true };
+                _threads[i].Start(i);
+            }
+
+            foreach (var thread in _threads)
+                thread.Join();
         }
 
         private void ThreadProc(object? state)
         {
-            var length = threads.Length;
-            var index = (int)state;
-            var count = result.Length / length;
+            var length = _threads.Length;
+            var index = (int)state!;
+            var count = _array.Length / length;
 
             var span = index == length - 1
-                ? result.AsSpan((index * count)..)
-                : result.AsSpan((index*count)..((index * count) + count));
+                ? _array.AsSpan((index * count)..)
+                : _array.AsSpan((index * count)..((index * count) + count));
 
-            for(var i = 0; i < span.Length; i++)
+            for (var i = 0; i < span.Length; i++)
             {
-                span[i] = randoms[index].Next();
+                ProcessValue(index, i, span);
+            }
+        }
+
+        protected abstract void ProcessValue(int threadIndex, int itemIndex, Span<T> span);
+    }
+
+    class GenRandomArray : GenRandomArray<int>
+    {
+        public GenRandomArray(int threadCount, int[] resultArray)
+            : base(threadCount, resultArray, r => r.Next())
+        {
+        }
+    }
+
+    class GenRandomArray<T> : MultiThreadingProcessor<T>
+    {
+        private readonly Func<Random, T> _randomize;
+        protected readonly Random[] _randoms;
+
+        public GenRandomArray(int threadCount, T[] array, Func<Random, T> randomize)
+            : base(threadCount, array)
+        {
+            this._randomize = randomize;
+            _randoms = new Random[threadCount];
+        }
+
+        public override void Process()
+        {
+            for (var i = 0; i < _randoms.Length; i++)
+            {
+                _randoms[i] = new Random();
+            }
+
+            base.Process();
+        }
+
+        protected override void ProcessValue(int threadIndex, int itemIndex, Span<T> span)
+        {
+            span[itemIndex] = _randomize(_randoms[threadIndex]);
+        }
+    }
+
+    class SumSearch : MultiThreadingProcessor<int>
+    {
+        private readonly long[] _results;
+
+        public long Result { get; private set; }
+
+        public SumSearch(int threadCount, int[] array)
+            : base(threadCount, array)
+        {
+            _results = new long[threadCount];
+        }
+
+        public override void Process()
+        {
+            base.Process();
+            Result = _results.Sum();
+        }
+
+        protected override void ProcessValue(int threadIndex, int itemIndex, Span<int> span)
+        {
+           _results[threadIndex] += span[itemIndex];
+        }
+    }
+
+    class FreqChar : MultiThreadingProcessor<char>
+    {
+        private readonly Dictionary<char, int>[] _results;
+
+        public Dictionary<char, int>? Result { get; private set; }
+
+        public FreqChar(int threadCount, char[] array)
+            : base(threadCount, array)
+        {
+            _results = new Dictionary<char, int>[threadCount];
+        }
+
+        public override void Process()
+        {
+            base.Process();
+            Result = new Dictionary<char, int>();
+
+            foreach (var item in _results)
+            {
+                foreach (var pair in item)
+                {
+                    if (Result.TryGetValue(pair.Key, out int value))
+                    {
+                        Result[pair.Key] = value + pair.Value;
+                    }
+                    else
+                    {
+                        Result[pair.Key] = pair.Value;
+                    }
+                }
+            }
+        }
+
+        protected override void ProcessValue(int threadIndex, int itemIndex, Span<char> span)
+        {
+            var ch = span[itemIndex];
+            var dic = _results[threadIndex];
+            if (dic == null)
+            {
+                _results[threadIndex] = dic = new Dictionary<char, int>();
+            }
+
+            if (dic.TryGetValue(ch, out int value))
+            {
+                dic[ch] = value + 1;
+            }
+            else
+            {
+                dic[ch] = 1;
             }
         }
     }
@@ -70,50 +276,42 @@ namespace MultiThreading_Lesson
     {
         static void Main(string[] args)
         {
-            //var obj = new SomeClasse();
-            //var obj2 = new SomeClasse();
-            //var obj3 = new SomeClasse();
-            //var obj4 = new SomeClasse();
+            var cancel = new CancellationTokenSource();
 
-            //var thread = new Thread(obj.ProcThread) { IsBackground = true };
-            //var thread2 = new Thread(obj2.ProcThread) { IsBackground = true };
-            //var thread3 = new Thread(obj3.ProcThread) { IsBackground = true };
-            //var thread4 = new Thread(obj4.ProcThread) { IsBackground = true };
+            const int threadCount = 10;
+            var arr = new int[1_000_000_000];
+            var taskRandom = new MultiTaskRandomProcessor<int>(threadCount, arr, r => r.Next());
+            var task = taskRandom.Process(cancel.Token);
 
-            var arr = new int[1_000];
-            var gen = new GenRandomArray(1, arr);
+            Console.WriteLine("Random is in process");
+            Console.WriteLine("For cancel press ESC");
+            while (!cancel.IsCancellationRequested && !task.IsCompleted)
+            {
+                var ch = Console.ReadKey();
+                if (ch.Key == ConsoleKey.Escape) cancel.Cancel();
+            }
 
-            // 1 - 00:00:05.1498743
-            // 2 - 00:00:02.6744600
-            // 3 - 00:00:01.8015496
-            // 4 - 00:00:01.5142132
-            // 5 - 00:00:01.3053252
-            // 8 - 00:00:00.9570645
-            // 16 - 00:00:00.7248890
-            // 32 - 00:00:00.7853518
-
+            // ============================================================================
+            var gen = new GenRandomArray(threadCount, arr);
             var sw = Stopwatch.StartNew();
             gen.Process();
             Console.WriteLine($"--> {sw.Elapsed}");
 
-            //Without threads
-            // 00:00:00.0549608
-            // 00:00:00.0809175
-            // 00:00:00.0635487
+            var sumProcessor = new SumSearch(threadCount, arr);
+            sw = Stopwatch.StartNew();
+            sumProcessor.Process();
+            Console.WriteLine($"--> {sw.Elapsed} --- result: {sumProcessor.Result}");
 
-            // With threads and WIthout LOCK
-            // 00:00:00.4483470
-            // 00:00:00.4645914
-            // 00:00:00.4451844
 
-            //With LOCK
-            // 00:00:05.6916445
-            // 00:00:06.6426243
-            // 00:00:05.9325970
+            var charArray = new char[1_000_000_000];
+            var chGen = new GenRandomArray<char>(threadCount, charArray, r => (char)r.Next(32, 58));
+            chGen.Process();
 
-            // 00:00:01.2150220
-            // 00:00:01.2147960
-            // 00:00:01.2144526
+            var freqDicProc = new FreqChar(threadCount, charArray);
+
+            sw = Stopwatch.StartNew();
+            freqDicProc.Process();
+            Console.WriteLine($"--> {sw.Elapsed} --- result: {freqDicProc.Result!.Count}");
         }
     }
 }
