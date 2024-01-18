@@ -1,274 +1,219 @@
-﻿using System.Diagnostics;
-using System.Drawing;
-using System.Threading;
-using System.Threading.Channels;
+﻿using MultiThreading_Lesson.Threads;
+using System.Diagnostics;
+using System.Numerics;
 
 namespace MultiThreading_Lesson
 {
-    class SingleTaskScheduler : TaskScheduler
+    interface ITaskProcessor
     {
-        private readonly object sync = new object();
-
-        private readonly Queue<Task> tasks = new Queue<Task>();
-
-        private Thread thread;
-
-        public SingleTaskScheduler()
-        {
-            thread = new Thread(ExcecuteTask) { Name = "OneForAll", IsBackground = true };
-            thread.Start();
-        }
-
-        protected override IEnumerable<Task>? GetScheduledTasks()
-        {
-            return tasks;
-        }
-
-        protected override void QueueTask(Task task)
-        {
-            lock (sync)
-            {
-                tasks.Enqueue(task);
-            }
-        }
-
-        private void ExcecuteTask(object? obj)
-        {
-            while (true)
-            {
-                lock (sync)
-                {
-                    if (tasks.Count > 0)
-                    {
-                        var task = tasks.Peek();
-                        if (TryDequeue(task))
-                            TryExecuteTask(task);
-                    }
-                }
-            }
-        }
-
-        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
-        {
-            return false;
-        }
-
-        protected override bool TryDequeue(Task task)
-        {
-            Task currentTask;
-            lock (sync)
-            {
-                currentTask = tasks.Dequeue();
-            }
-
-            return currentTask == task;
-        }
+        Task Process(CancellationToken cancellationToken = default);
     }
 
-    class MultiTaskRandomProcessor<T>
+    interface ITaskProcessor<TResult>
     {
-        private readonly Task[] _tasks;
-        private readonly T[] _array;
-        private readonly Func<Random, T> _randomize;
-        protected readonly Random[] _randoms;
+        Task<TResult> Process(CancellationToken cancellationToken = default);
+    }
 
-        public MultiTaskRandomProcessor(int threadCount, T[] array, Func<Random, T> randomize)
+    abstract class MultiTaskProcessorBase<TItem> : ITaskProcessor
+    {
+        protected readonly Task[] _tasks;
+        private readonly TItem[] _array;
+
+        public MultiTaskProcessorBase(int taskCount, TItem[] array)
         {
-            _tasks = new Task[threadCount];
+            _tasks = new Task[taskCount];
             _array = array;
-            _randomize = randomize;
-            _randoms = new Random[threadCount];
         }
 
         public virtual Task Process(CancellationToken cancellationToken = default)
         {
-            for (var i = 0; i < _randoms.Length; i++)
-            {
-                _randoms[i] = new Random();
-            }
             for (int i = 0; i < _tasks.Length; i++)
             {
+                var length = _tasks.Length;
                 var index = i;
-                _tasks[i] = Task.Run(() => ThreadProc(index, cancellationToken), cancellationToken);
+                var count = _array.Length / length;
+
+                var memory = index == length - 1
+                    ? _array.AsMemory((index * count)..)
+                    : _array.AsMemory((index * count)..((index * count) + count));
+
+                _tasks[i] = CreateAndRunTask(index, memory, cancellationToken);
             }
 
             return Task.WhenAll(_tasks);
         }
 
-        private void ThreadProc(int threadIndex, CancellationToken cancellationToken = default)
+        protected abstract Task CreateAndRunTask(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default);
+    }
+
+    abstract class MultiTaskProcessor<TItem> : MultiTaskProcessorBase<TItem>
+    {
+        protected MultiTaskProcessor(int threadCount, TItem[] array)
+            : base(threadCount, array) { }
+
+        protected override Task CreateAndRunTask(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
+            => Task.Run(() => ProcessPartArray(taskIndex, items, cancellationToken), cancellationToken);
+
+        private void ProcessPartArray(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
         {
-            var length = _tasks.Length;
-            var index = threadIndex;
-            var count = _array.Length / length;
-
-            var span = index == length - 1
-                ? _array.AsSpan((index * count)..)
-                : _array.AsSpan((index * count)..((index * count) + count));
-
+            var span = items.Span;
             for (var i = 0; !cancellationToken.IsCancellationRequested && i < span.Length; i++)
-            {
-                ProcessValue(index, i, span);
-            }
+                ProcessItem(taskIndex, i, span);
         }
 
-        protected void ProcessValue(int threadIndex, int itemIndex, Span<T> span)
-        {
-            span[itemIndex] = _randomize(_randoms[threadIndex]);
-        }
+        protected abstract void ProcessItem(int taskIndex, int itemIndex, Span<TItem> span);
     }
 
-    abstract class MultiThreadingProcessor<T>
+    abstract class MultiTaskProcessor<TItem, TResult> : MultiTaskProcessorBase<TItem>, ITaskProcessor<TResult>
     {
-        private readonly Thread[] _threads;
-        private readonly T[] _array;
+        protected MultiTaskProcessor(int threadCount, TItem[] array)
+            : base(threadCount, array) { }
 
-        public MultiThreadingProcessor(int threadCount, T[] array)
+        public override Task<TResult> Process(CancellationToken cancellationToken = default)
+            => base.Process(cancellationToken)
+                .ContinueWith(t => HandleResults(_tasks.OfType<Task<TResult>>()), cancellationToken);
+
+        protected override Task CreateAndRunTask(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
+            => Task.Run(() => ProcessPartArray(taskIndex, items, cancellationToken), cancellationToken);
+
+        private TResult? ProcessPartArray(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
         {
-            _threads = new Thread[threadCount];
-            _array = array;
+            TResult? result = default;
+            var span = items.Span;
+            for (var i = 0; !cancellationToken.IsCancellationRequested && i < span.Length; i++)
+                result = ProcessItem(taskIndex, i, span, result);
+            return result;
         }
 
-        public virtual void Process()
-        {
-            for (int i = 0; i < _threads.Length; i++)
-            {
-                _threads[i] = new Thread(ThreadProc) { IsBackground = true };
-                _threads[i].Start(i);
-            }
+        protected abstract TResult? ProcessItem(int taskIndex, int itemIndex, Span<TItem> span, TResult? result);
 
-            foreach (var thread in _threads)
-                thread.Join();
-        }
 
-        private void ThreadProc(object? state)
-        {
-            var length = _threads.Length;
-            var index = (int)state!;
-            var count = _array.Length / length;
-
-            var span = index == length - 1
-                ? _array.AsSpan((index * count)..)
-                : _array.AsSpan((index * count)..((index * count) + count));
-
-            for (var i = 0; i < span.Length; i++)
-            {
-                ProcessValue(index, i, span);
-            }
-        }
-
-        protected abstract void ProcessValue(int threadIndex, int itemIndex, Span<T> span);
+        protected abstract TResult HandleResults(IEnumerable<Task<TResult>> enumerable);
     }
 
-    class GenRandomArray : GenRandomArray<int>
-    {
-        public GenRandomArray(int threadCount, int[] resultArray)
-            : base(threadCount, resultArray, r => r.Next())
-        {
-        }
-    }
+    // ===========================
 
-    class GenRandomArray<T> : MultiThreadingProcessor<T>
+    class MultiTaskRandomProcessor<T> : MultiTaskProcessor<T>
     {
         private readonly Func<Random, T> _randomize;
         protected readonly Random[] _randoms;
 
-        public GenRandomArray(int threadCount, T[] array, Func<Random, T> randomize)
+        public MultiTaskRandomProcessor(int threadCount, T[] array, Func<Random, T> randomize)
             : base(threadCount, array)
         {
-            this._randomize = randomize;
+            _randomize = randomize;
             _randoms = new Random[threadCount];
-        }
 
-        public override void Process()
-        {
-            for (var i = 0; i < _randoms.Length; i++)
+            var r = new Random();
+            for (var i = 0; i < threadCount; i++)
             {
-                _randoms[i] = new Random();
+                _randoms[i] = new Random(r.Next());
             }
-
-            base.Process();
         }
 
-        protected override void ProcessValue(int threadIndex, int itemIndex, Span<T> span)
+        protected override void ProcessItem(int taskIndex, int itemIndex, Span<T> span)
         {
-            span[itemIndex] = _randomize(_randoms[threadIndex]);
+            span[itemIndex] = _randomize(_randoms[taskIndex]);
         }
     }
 
-    class SumSearch : MultiThreadingProcessor<int>
+    class MultiTaskSumProcessor : MultiTaskProcessor<int, long>
     {
-        private readonly long[] _results;
-
-        public long Result { get; private set; }
-
-        public SumSearch(int threadCount, int[] array)
-            : base(threadCount, array)
+        public MultiTaskSumProcessor(int threadCount, int[] array) : base(threadCount, array)
         {
-            _results = new long[threadCount];
         }
 
-        public override void Process()
+        protected override long HandleResults(IEnumerable<Task<long>> enumerable)
         {
-            base.Process();
-            Result = _results.Sum();
+            return enumerable.Select(t => t.Result).Sum();
         }
 
-        protected override void ProcessValue(int threadIndex, int itemIndex, Span<int> span)
+        protected override long ProcessItem(int taskIndex, int itemIndex, Span<int> span, long result)
         {
-           _results[threadIndex] += span[itemIndex];
+            return result + span[itemIndex];
         }
     }
 
-    class FreqChar : MultiThreadingProcessor<char>
+    class MultiTaskMinProcessor : MultiTaskProcessor<int, int>
     {
-        private readonly Dictionary<char, int>[] _results;
-
-        public Dictionary<char, int>? Result { get; private set; }
-
-        public FreqChar(int threadCount, char[] array)
+        public MultiTaskMinProcessor(int threadCount, int[] array)
             : base(threadCount, array)
         {
-            _results = new Dictionary<char, int>[threadCount];
         }
 
-        public override void Process()
+        protected override int HandleResults(IEnumerable<Task<int>> enumerable)
         {
-            base.Process();
-            Result = new Dictionary<char, int>();
+            return enumerable.Select(t => t.Result).Min();
+        }
 
-            foreach (var item in _results)
+        protected override int ProcessItem(int taskIndex, int itemIndex, Span<int> span, int result)
+        {
+            return result > span[itemIndex] ? span[itemIndex] : result;
+        }
+    }
+
+    class MultiTaskMaxProcessor : MultiTaskProcessor<int, int>
+    {
+        public MultiTaskMaxProcessor(int threadCount, int[] array)
+            : base(threadCount, array)
+        {
+        }
+
+        protected override int HandleResults(IEnumerable<Task<int>> enumerable)
+        {
+            return enumerable.Select(t => t.Result).Max();
+        }
+
+        protected override int ProcessItem(int taskIndex, int itemIndex, Span<int> span, int result)
+        {
+            return result < span[itemIndex] ? span[itemIndex] : result;
+        }
+    }
+
+    class MultiTaskCharProcessor : MultiTaskProcessor<char, Dictionary<char, int>>
+    {
+        public MultiTaskCharProcessor(int threadCount, char[] array) : base(threadCount, array)
+        {
+        }
+
+        protected override Dictionary<char, int> HandleResults(IEnumerable<Task<Dictionary<char, int>>> enumerable)
+        {
+            var result = new Dictionary<char, int>();
+
+            foreach (var item in enumerable.Select(t => t.Result))
             {
                 foreach (var pair in item)
                 {
-                    if (Result.TryGetValue(pair.Key, out int value))
+                    if (result.TryGetValue(pair.Key, out int value))
                     {
-                        Result[pair.Key] = value + pair.Value;
+                        result[pair.Key] = value + pair.Value;
                     }
                     else
                     {
-                        Result[pair.Key] = pair.Value;
+                        result[pair.Key] = pair.Value;
                     }
                 }
             }
+
+            return result;
         }
 
-        protected override void ProcessValue(int threadIndex, int itemIndex, Span<char> span)
+        protected override Dictionary<char, int>? ProcessItem(int taskIndex, int itemIndex, Span<char> span, Dictionary<char, int>? result)
         {
-            var ch = span[itemIndex];
-            var dic = _results[threadIndex];
-            if (dic == null)
-            {
-                _results[threadIndex] = dic = new Dictionary<char, int>();
-            }
+            if (result == null)
+                result = new Dictionary<char, int>();
 
-            if (dic.TryGetValue(ch, out int value))
+            var ch = span[itemIndex];
+            if (result.TryGetValue(ch, out int value))
             {
-                dic[ch] = value + 1;
+                result[ch] = value + 1;
             }
             else
             {
-                dic[ch] = 1;
+                result[ch] = 1;
             }
+
+            return result;
         }
     }
 
@@ -276,22 +221,121 @@ namespace MultiThreading_Lesson
     {
         static void Main(string[] args)
         {
-            var cancel = new CancellationTokenSource();
+            const int taskCount = 4;
+            Console.CursorVisible = false;
 
-            const int threadCount = 10;
-            var arr = new int[1_000_000_000];
-            var taskRandom = new MultiTaskRandomProcessor<int>(threadCount, arr, r => r.Next());
-            var task = taskRandom.Process(cancel.Token);
+            var sw = Stopwatch.StartNew();
 
-            Console.WriteLine("Random is in process");
-            Console.WriteLine("For cancel press ESC");
-            while (!cancel.IsCancellationRequested && !task.IsCompleted)
-            {
-                var ch = Console.ReadKey();
-                if (ch.Key == ConsoleKey.Escape) cancel.Cancel();
-            }
+            var t1 = StartIntBlock(taskCount);
+            var t2 = StartCharBlock(taskCount);
+
+            Task.WaitAll(t1, t2);
+
+            sw.Stop();
+            Console.SetCursorPosition(0, 10);
+            Console.WriteLine($"Done! Total time {sw.Elapsed}");
 
             // ============================================================================
+            //MultiThreadind_Work(threadCount);
+        }
+
+        static object consoleSync = new object();
+
+        static Task StartIntBlock(int taskCount)
+        {
+            var arr = new int[1_000_000_000];
+            var intRandomProcessor = new MultiTaskRandomProcessor<int>(taskCount, arr, r => r.Next());
+
+            var sumProcessor = new MultiTaskSumProcessor(taskCount, arr);
+            var minProcessor = new MultiTaskMinProcessor(taskCount, arr);
+            var maxProcessor = new MultiTaskMaxProcessor(taskCount, arr);
+
+            Task intRandomTask = StartProcess(0, "Gen random ints", intRandomProcessor);
+            Task continueAfterIntRandom = intRandomTask.ContinueWith(t =>
+            {
+                Task sumTask = StartProcess(1, "\tSearch sum", sumProcessor);
+                Task minTask = StartProcess(2, "\tSearch min", minProcessor);
+                Task maxTask = StartProcess(3, "\tSearch max", maxProcessor);
+
+                Task.WaitAll(sumTask, minTask, maxTask);
+            });
+
+            return continueAfterIntRandom;
+        }
+
+        static Task StartCharBlock(int taskCount)
+        {
+            var chars = new char[1_000_000_000];
+            var charRandomProcessor = new MultiTaskRandomProcessor<char>(taskCount, chars, r => (char)r.Next(32, 58));
+            var charProcessor = new MultiTaskCharProcessor(taskCount, chars);
+
+            Task charRandomTask = StartProcess(4, "Gen random chars", charRandomProcessor);
+
+            Task continueAfterCharRandom = charRandomTask.ContinueWith(t =>
+            {
+                var task = StartProcess(5, "\tSearch chars dictionary", charProcessor);
+                task.Wait();
+            });
+
+            return continueAfterCharRandom;
+        }
+
+        static string[] dots = new string[] { ".", "..", "...", "....", "....." };
+
+        static Task StartProcess(int line, string name, ITaskProcessor processor)
+        {
+            CancellationTokenSource cancel = new CancellationTokenSource();
+            Stopwatch sw = new Stopwatch();
+
+            var progressTask = Task.Run(() =>
+            {
+                var i = 0;
+                var token = cancel.Token;
+                while (!token.IsCancellationRequested)
+                {
+                    Print(line, $"Start {name}{dots[i]}");
+                    i++;
+                    if (i >= dots.Length) i = 0;
+
+                    try
+                    {
+                        Task.Delay(150).Wait(token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+            }, cancel.Token)
+                .ContinueWith(t =>
+                {
+                    Print(line, $"{name} ---> {sw.Elapsed}");
+                });
+
+            sw.Start();
+            return processor.Process()
+                .ContinueWith(t =>
+                {
+                    sw.Stop();
+                    cancel.Cancel();
+                });
+        }
+
+        private static void Print(int line, string text)
+        {
+            lock (consoleSync)
+            {
+                Console.SetCursorPosition(0, line);
+                Console.WriteLine("                                              ");
+                Console.SetCursorPosition(0, line);
+                Console.WriteLine(text);
+            }
+        }
+
+        private static void MultiThreadind_Work(int threadCount)
+        {
+            var arr = new int[1_000_000_000];
+
             var gen = new GenRandomArray(threadCount, arr);
             var sw = Stopwatch.StartNew();
             gen.Process();
