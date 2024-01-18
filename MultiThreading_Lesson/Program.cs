@@ -1,6 +1,6 @@
 ﻿using MultiThreading_Lesson.Threads;
 using System.Diagnostics;
-using System.Numerics;
+using System.Linq;
 
 namespace MultiThreading_Lesson
 {
@@ -229,7 +229,7 @@ namespace MultiThreading_Lesson
 
     internal class Program
     {
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             const int taskCount = 4;
             Console.CursorVisible = false;
@@ -239,11 +239,13 @@ namespace MultiThreading_Lesson
             var t1 = StartIntBlock(taskCount);
             var t2 = StartCharBlock(taskCount);
 
-            Task.WaitAll(t1, t2);
+            await Task.WhenAll(t1, t2);
 
             sw.Stop();
             Console.SetCursorPosition(0, 10);
             Console.WriteLine($"Done! Total time {sw.Elapsed}");
+
+            Console.WriteLine($"Sum: {t1.Result.sum}, Min: {t1.Result.min}, Max: {t1.Result.max}, Chars: {t2.Result.Count}");
 
             // ============================================================================
             //MultiThreadind_Work(threadCount);
@@ -251,32 +253,33 @@ namespace MultiThreading_Lesson
 
         static object consoleSync = new object();
 
-        static async Task StartIntBlock(int taskCount)
+        static async Task<(long sum, int min, int max)> StartIntBlock(int taskCount)
         {
             var arr = new int[1_000_000_000];
             var intRandomProcessor = new MultiTaskRandomProcessor<int>(taskCount, arr, r => r.Next());
+
+            await StartProcess(0, "Gen random ints", intRandomProcessor);
 
             var sumProcessor = new MultiTaskSumProcessor(taskCount, arr);
             var minProcessor = new MultiTaskMinProcessor(taskCount, arr);
             var maxProcessor = new MultiTaskMaxProcessor(taskCount, arr);
 
-            await StartProcess(0, "Gen random ints", intRandomProcessor);
-
-            var sum = StartProcess(1, "\tSearch sum", sumProcessor);
-            var min = StartProcess(2, "\tSearch min", minProcessor);
-            var max = StartProcess(3, "\tSearch max", maxProcessor);
+            var sum = StartProcess<long>(1, "\tSearch sum", sumProcessor);
+            var min = StartProcess<int>(2, "\tSearch min", minProcessor);
+            var max = StartProcess<int>(3, "\tSearch max", maxProcessor);
 
             await Task.WhenAll(sum, min, max);
+            return (sum.Result, min.Result, max.Result);
         }
 
-        static async Task StartCharBlock(int taskCount)
+        static async Task<Dictionary<char, int>> StartCharBlock(int taskCount)
         {
             var chars = new char[1_000_000_000];
             var charRandomProcessor = new MultiTaskRandomProcessor<char>(taskCount, chars, r => (char)r.Next(32, 58));
             var charProcessor = new MultiTaskCharProcessor(taskCount, chars);
 
             await StartProcess(4, "Gen random chars", charRandomProcessor);
-            await StartProcess(5, "\tSearch chars dictionary", charProcessor);
+            return await StartProcess<Dictionary<char, int>>(5, "\tSearch chars dictionary", charProcessor);
         }
 
         static string[] dots = new string[] { ".", "..", "...", "....", "....." };
@@ -310,9 +313,65 @@ namespace MultiThreading_Lesson
             sw.Start();
             await processor.Process();
             sw.Stop();
+
             cancel.Cancel();
             await progressTask;
+
             Print(line, $"{name} ---> {sw.Elapsed}");
+        }
+
+        static async Task<TResult> StartProcess<TResult>(int line, string name, ITaskProcessor<TResult> processor)
+        {
+            CancellationTokenSource cancel = new CancellationTokenSource();
+            Stopwatch sw = new Stopwatch();
+
+            var progressTask = Task.Run(() =>
+            {
+                var i = 0;
+                var token = cancel.Token;
+                while (!token.IsCancellationRequested)
+                {
+                    Print(line, $"Start {name}{dots[i]}");
+                    i++;
+                    if (i >= dots.Length) i = 0;
+
+                    try
+                    {
+                        Task.Delay(150).Wait(token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        return;
+                    }
+                }
+            }, cancel.Token);
+
+            sw.Start();
+            var result = await processor.Process();
+            sw.Stop();
+
+            cancel.Cancel();
+            await progressTask;
+
+            Print(line, $"{name} ---> {sw.Elapsed}{GetResultForPrint(result)}");
+            return result;
+        }
+
+        private static int GetCount(System.Collections.IEnumerable collection)
+        {
+            var enumerator = collection.GetEnumerator();
+            var count = 0;
+            while (enumerator.MoveNext()) count++;
+            return count;
+        } 
+
+        private static string GetResultForPrint<TResult>(TResult? result)
+        {
+            if (result is System.Collections.IEnumerable collection)
+            {
+                return $"Count: {GetCount(collection)}";
+            }
+            return result?.ToString() ?? string.Empty;
         }
 
         private static void Print(int line, string text)
