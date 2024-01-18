@@ -48,11 +48,16 @@ namespace MultiThreading_Lesson
 
     abstract class MultiTaskProcessor<TItem> : MultiTaskProcessorBase<TItem>
     {
+        private readonly TaskFactory _taskFactory;
+
         protected MultiTaskProcessor(int threadCount, TItem[] array)
-            : base(threadCount, array) { }
+            : base(threadCount, array) {
+
+            _taskFactory = new TaskFactory(TaskCreationOptions.LongRunning, TaskContinuationOptions.None);
+        }
 
         protected override Task CreateAndRunTask(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
-            => Task.Run(() => ProcessPartArray(taskIndex, items, cancellationToken), cancellationToken);
+            => _taskFactory.StartNew(() => ProcessPartArray(taskIndex, items, cancellationToken), cancellationToken);
 
         private void ProcessPartArray(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
         {
@@ -66,15 +71,20 @@ namespace MultiThreading_Lesson
 
     abstract class MultiTaskProcessor<TItem, TResult> : MultiTaskProcessorBase<TItem>, ITaskProcessor<TResult>
     {
+        private readonly TaskFactory<TResult> _tasksFactory;
+
         protected MultiTaskProcessor(int threadCount, TItem[] array)
-            : base(threadCount, array) { }
+            : base(threadCount, array)
+        {
+            _tasksFactory = new TaskFactory<TResult>(TaskCreationOptions.LongRunning, TaskContinuationOptions.None);
+        }
 
         public override Task<TResult> Process(CancellationToken cancellationToken = default)
             => base.Process(cancellationToken)
                 .ContinueWith(t => HandleResults(_tasks.OfType<Task<TResult>>()), cancellationToken);
 
         protected override Task CreateAndRunTask(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
-            => Task.Run(() => ProcessPartArray(taskIndex, items, cancellationToken), cancellationToken);
+            => _tasksFactory.StartNew(() => ProcessPartArray(taskIndex, items, cancellationToken)!, cancellationToken);
 
         private TResult? ProcessPartArray(int taskIndex, Memory<TItem> items, CancellationToken cancellationToken = default)
         {
@@ -241,7 +251,7 @@ namespace MultiThreading_Lesson
 
         static object consoleSync = new object();
 
-        static Task StartIntBlock(int taskCount)
+        static async Task StartIntBlock(int taskCount)
         {
             var arr = new int[1_000_000_000];
             var intRandomProcessor = new MultiTaskRandomProcessor<int>(taskCount, arr, r => r.Next());
@@ -250,39 +260,28 @@ namespace MultiThreading_Lesson
             var minProcessor = new MultiTaskMinProcessor(taskCount, arr);
             var maxProcessor = new MultiTaskMaxProcessor(taskCount, arr);
 
-            Task intRandomTask = StartProcess(0, "Gen random ints", intRandomProcessor);
-            Task continueAfterIntRandom = intRandomTask.ContinueWith(t =>
-            {
-                Task sumTask = StartProcess(1, "\tSearch sum", sumProcessor);
-                Task minTask = StartProcess(2, "\tSearch min", minProcessor);
-                Task maxTask = StartProcess(3, "\tSearch max", maxProcessor);
+            await StartProcess(0, "Gen random ints", intRandomProcessor);
 
-                Task.WaitAll(sumTask, minTask, maxTask);
-            });
+            var sum = StartProcess(1, "\tSearch sum", sumProcessor);
+            var min = StartProcess(2, "\tSearch min", minProcessor);
+            var max = StartProcess(3, "\tSearch max", maxProcessor);
 
-            return continueAfterIntRandom;
+            await Task.WhenAll(sum, min, max);
         }
 
-        static Task StartCharBlock(int taskCount)
+        static async Task StartCharBlock(int taskCount)
         {
             var chars = new char[1_000_000_000];
             var charRandomProcessor = new MultiTaskRandomProcessor<char>(taskCount, chars, r => (char)r.Next(32, 58));
             var charProcessor = new MultiTaskCharProcessor(taskCount, chars);
 
-            Task charRandomTask = StartProcess(4, "Gen random chars", charRandomProcessor);
-
-            Task continueAfterCharRandom = charRandomTask.ContinueWith(t =>
-            {
-                var task = StartProcess(5, "\tSearch chars dictionary", charProcessor);
-                task.Wait();
-            });
-
-            return continueAfterCharRandom;
+            await StartProcess(4, "Gen random chars", charRandomProcessor);
+            await StartProcess(5, "\tSearch chars dictionary", charProcessor);
         }
 
         static string[] dots = new string[] { ".", "..", "...", "....", "....." };
 
-        static Task StartProcess(int line, string name, ITaskProcessor processor)
+        static async Task StartProcess(int line, string name, ITaskProcessor processor)
         {
             CancellationTokenSource cancel = new CancellationTokenSource();
             Stopwatch sw = new Stopwatch();
@@ -306,19 +305,14 @@ namespace MultiThreading_Lesson
                         return;
                     }
                 }
-            }, cancel.Token)
-                .ContinueWith(t =>
-                {
-                    Print(line, $"{name} ---> {sw.Elapsed}");
-                });
+            }, cancel.Token);
 
             sw.Start();
-            return processor.Process()
-                .ContinueWith(t =>
-                {
-                    sw.Stop();
-                    cancel.Cancel();
-                });
+            await processor.Process();
+            sw.Stop();
+            cancel.Cancel();
+            await progressTask;
+            Print(line, $"{name} ---> {sw.Elapsed}");
         }
 
         private static void Print(int line, string text)
